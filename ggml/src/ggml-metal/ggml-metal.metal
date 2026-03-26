@@ -631,21 +631,22 @@ constant half turbo_centroids_3bit_h[8] = {
 };
 
 // Vec: 4 elements per call (il ∈ {0..7}), returns type4
-// Register centroid×norm LUT — ported from @spiritbuun's CUDA implementation.
-// Precompute centroid[i]*norm into thread-local registers once per block,
-// then index into registers instead of hitting constant memory per element.
-// On CUDA this gave 96-97% decode speed vs q8_0 (up from ~88%).
+// GitHub issue #39: Fused Q·Centroid compressed attention
+//
+// Tested approaches:
+//   float cn[8]: SPILL (32 bytes, 0.879x) — Metal register file too small
+//   half cn_norm[8]: SPILL (16 bytes, 0.869x) — array indexing forces stack
+//   constant half[8] + float norm: BASELINE (0.905x) — current best
+//
+// The fundamental issue: Metal can't do data-dependent indexing into registers.
+// Any array with variable index goes to thread stack memory, which is slower
+// than constant memory for an 8-entry LUT. This is unlike CUDA where register
+// arrays with small indices stay in the register file.
+//
+// Keeping the proven constant half[8] approach.
 template <typename type4>
 void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread type4 & reg) {
     const float norm = float(xb->norm);
-
-    // Original 8-entry constant half LUT + float norm broadcast.
-    // Register LUT approach (cn[8] array) tested but caused register spill
-    // on Metal, making it slower than constant memory. Reverting to the
-    // proven approach from main branch: constant half LUT + float multiply.
-    // This is the fastest vec dequant on M5 Max (77.4 tok/s).
-    // Note: @spiritbuun's register LUT works great on CUDA (96-97% of q8_0)
-    // but Metal's register file handles it differently.
     const uint8_t qb = xb->qs[il];
     const uint8_t sb = xb->signs[il >> 1];
     const int sshift = (il & 1) << 2;
