@@ -681,6 +681,10 @@ void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread t
 #define TURBO_USE_SMEM_DEQUANT 0
 #endif
 
+#ifndef TURBO_USE_QC_PRECOMPUTE
+#define TURBO_USE_QC_PRECOMPUTE 0
+#endif
+
 #if TURBO_PROFILE_MODE == 1
     // NO-OP: decode speed ceiling
     reg = type4(0.0f);
@@ -7219,6 +7223,20 @@ kernel void kernel_flash_attn_ext_vec(
                 pk4 += ty*NS10/4 + tx;
                 pq4 += tx;
 
+#if TURBO_USE_QC_PRECOMPUTE && TURBO_USE_4MAG
+                // Q·CENTROID PRECOMPUTE: precompute mag[c] * Q[j] for c=0..3, j=0..3.
+                // This table is computed ONCE per outer iteration, reused for all C cache positions.
+                // Using named float4 variables (NOT arrays) to avoid register spill on Metal.
+                // Metal's register allocator spills arrays to stack memory; named vars stay in registers.
+                // 4 float4 values = 16 floats in registers.
+                // After this, the inner loop needs ZERO constant memory reads — only 4 reads HERE.
+                const float4 qv_for_precompute = (float4) pq4[0]; // this thread's Q chunk (4 elements)
+                const float4 mag_q0 = qv_for_precompute * float(turbo_mag_3bit_h[0]);
+                const float4 mag_q1 = qv_for_precompute * float(turbo_mag_3bit_h[1]);
+                const float4 mag_q2 = qv_for_precompute * float(turbo_mag_3bit_h[2]);
+                const float4 mag_q3 = qv_for_precompute * float(turbo_mag_3bit_h[3]);
+#endif
+
                 qk_t mqk[C/NE] = { [ 0 ... C/NE - 1] = 0.0f };
 
                 // each simdgroup processes 1 query and NE (NW/NL) cache elements
@@ -7236,6 +7254,72 @@ kernel void kernel_flash_attn_ext_vec(
                         FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
                             const short i = ii*NL + tx;
                             mqk[cc] += dot((float4) smem_dq[(NE*cc + ty) * DK4 + i], (float4) sq4[i]);
+                        }
+#elif TURBO_USE_QC_PRECOMPUTE && TURBO_USE_4MAG
+                        // Q·CENTROID PRECOMPUTE: zero constant reads in inner loop.
+                        // Precompute mag_q[c][j] = mag[c] * Q[j] for c=0..3, j=0..3 ONCE before cc loop.
+                        // Then inner loop: score = sum_j( mag_q[mi_j][j] * sign_j ) * norm
+                        // Only register reads + ALU in the hot path.
+                        {
+                        device const kd4_t * pk = (device const kd4_t *) (k + ((ic + NE*cc + ty)*args.nb11));
+
+                        FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                            const short i = ii*NL + tx;
+                            const short blk_idx = i / nl_k;
+                            const short il = i % nl_k;
+
+                            device const block_turbo3_0 * xb = ((device const block_turbo3_0 *)pk) + blk_idx;
+                            const float norm = float(xb->norm);
+                            const uint8_t qb = xb->qs[il];
+                            const uint8_t sb = xb->signs[il >> 1];
+                            const int sshift = (il & 1) << 2;
+
+                            const uint8_t q0 = (qb      ) & 0x03;
+                            const uint8_t q1 = (qb >> 2) & 0x03;
+                            const uint8_t q2 = (qb >> 4) & 0x03;
+                            const uint8_t q3 = (qb >> 6);
+                            const uint8_t s0 = (sb >> (sshift    )) & 1;
+                            const uint8_t s1 = (sb >> (sshift + 1)) & 1;
+                            const uint8_t s2 = (sb >> (sshift + 2)) & 1;
+                            const uint8_t s3 = (sb >> (sshift + 3)) & 1;
+
+                            // XOR sign reversal for magnitude index
+                            const uint8_t mi0 = q0 ^ (s0 ? 0u : 0x3u);
+                            const uint8_t mi1 = q1 ^ (s1 ? 0u : 0x3u);
+                            const uint8_t mi2 = q2 ^ (s2 ? 0u : 0x3u);
+                            const uint8_t mi3 = q3 ^ (s3 ? 0u : 0x3u);
+
+                            // Look up from precomputed mag_q — ZERO constant reads in inner loop
+                            // Use nested select to index named float4 vars (avoids array spill)
+                            // 2-bit index: bit1 selects high/low pair, bit0 selects within pair
+                            // select(a, b, cond): returns b when cond is true, a when false
+                            // This compiles to 2 branches per element on Apple8 (vs 1 constant read)
+
+                            // Branchless sign: 2*s - 1 = +1 when s=1, -1 when s=0
+                            const float sg0 = 2.0f * float(s0) - 1.0f;
+                            const float sg1 = 2.0f * float(s1) - 1.0f;
+                            const float sg2 = 2.0f * float(s2) - 1.0f;
+                            const float sg3 = 2.0f * float(s3) - 1.0f;
+
+                            // 2-level select: bit1 chooses pair, bit0 chooses within pair
+                            const float4 lo0 = select(mag_q0, mag_q1, bool4(mi0 & 1));
+                            const float4 hi0 = select(mag_q2, mag_q3, bool4(mi0 & 1));
+                            const float mq0 = select(lo0, hi0, bool4(mi0 & 2)).x * sg0;
+
+                            const float4 lo1 = select(mag_q0, mag_q1, bool4(mi1 & 1));
+                            const float4 hi1 = select(mag_q2, mag_q3, bool4(mi1 & 1));
+                            const float mq1 = select(lo1, hi1, bool4(mi1 & 2)).y * sg1;
+
+                            const float4 lo2 = select(mag_q0, mag_q1, bool4(mi2 & 1));
+                            const float4 hi2 = select(mag_q2, mag_q3, bool4(mi2 & 1));
+                            const float mq2 = select(lo2, hi2, bool4(mi2 & 2)).z * sg2;
+
+                            const float4 lo3 = select(mag_q0, mag_q1, bool4(mi3 & 1));
+                            const float4 hi3 = select(mag_q2, mag_q3, bool4(mi3 & 1));
+                            const float mq3 = select(lo3, hi3, bool4(mi3 & 2)).w * sg3;
+
+                            mqk[cc] += (mq0 + mq1 + mq2 + mq3) * norm;
+                        }
                         }
 #elif TURBO_USE_4MAG && TURBO_FUSED_BLOCK_DOT
                         device const kd4_t * pk = (device const kd4_t *) (k + ((ic + NE*cc + ty)*args.nb11));

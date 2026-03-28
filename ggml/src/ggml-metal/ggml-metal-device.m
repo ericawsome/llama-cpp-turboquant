@@ -256,12 +256,23 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
 
                 // SMEM pre-dequant: move centroid LUT reads out of FA inner loop
                 // into threadgroup memory. Opt-in via TURBO_SMEM_DEQUANT=1 env var.
-                // Only beneficial on pre-M5 hardware where constant cache divergence is expensive.
+                // NEGATIVE RESULT: -51% at 8K on M2 Pro. Kept for reference.
                 {
                     const char * smem_dq = getenv("TURBO_SMEM_DEQUANT");
                     if (smem_dq && smem_dq[0] == '1') {
                         [prep setObject:@"1" forKey:@"TURBO_USE_SMEM_DEQUANT"];
                         GGML_LOG_INFO("%s: turbo3/4 SMEM pre-dequant enabled\n", __func__);
+                    }
+                }
+
+                // Q·centroid precompute: precompute mag[c]*Q[j] table before K loop.
+                // Eliminates ALL constant reads from inner loop (4 reads ONCE vs 4*C=128).
+                // Opt-in via TURBO_QC_PRECOMPUTE=1 env var.
+                {
+                    const char * qc = getenv("TURBO_QC_PRECOMPUTE");
+                    if (qc && qc[0] == '1') {
+                        [prep setObject:@"1" forKey:@"TURBO_USE_QC_PRECOMPUTE"];
+                        GGML_LOG_INFO("%s: turbo3 Q·centroid precompute enabled\n", __func__);
                     }
                 }
 
