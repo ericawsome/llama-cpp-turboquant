@@ -10,6 +10,7 @@ on:
   push:
     branches:
       - master
+      - feature/turboquant-kv-cache 
     paths: [
       '.github/workflows/release.yml',
       '**/CMakeLists.txt',
